@@ -15,11 +15,12 @@ AI_MODE = "AI-assisted analysis"
 LOCAL_MODE = "Transparent local checks (AI provider unavailable)"
 
 # ---------------------------------------------------------------------------
-# Provider configuration
+# Provider configuration — hardcoded, no env var needed for the URL.
+# Gemini's OpenAI-compatible chat-completions endpoint (full path).
 # ---------------------------------------------------------------------------
-# Gemini's OpenAI-compatible base URL. Do NOT include /chat/completions here;
-# the code below appends it once, safely.
-DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+GEMINI_CHAT_COMPLETIONS_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+)
 DEFAULT_MODEL = "gemini-2.5-flash"
 
 SUSPICIOUS_PATTERNS = [
@@ -85,48 +86,13 @@ def _get_api_key():
     return ""
 
 
-def _get_base_url():
-    """
-    Return a normalized base URL ending with /openai (no trailing slash).
-
-    This is defensive: it accepts whatever the user put in OPENAI_BASE_URL
-    and rewrites it into the one form that actually works with Gemini.
-    """
-    raw = os.getenv("OPENAI_BASE_URL", "").strip()
-
-    if not raw:
-        return DEFAULT_BASE_URL
-
-    # Strip trailing slashes.
-    raw = raw.rstrip("/")
-
-    # If the user accidentally included /chat/completions, remove it.
-    if raw.endswith("/chat/completions"):
-        raw = raw[: -len("/chat/completions")]
-
-    # If they pointed at the native endpoint (…/v1beta), turn it into the
-    # OpenAI-compatible endpoint (…/v1beta/openai).
-    if raw.endswith("/v1beta"):
-        raw = raw + "/openai"
-    elif raw.endswith("/v1"):
-        raw = raw[:-3] + "/v1beta/openai"
-
-    # If they gave a full OpenAI-style base but forgot /openai, add it.
-    if not raw.endswith("/openai"):
-        # Only append if the path looks like the Gemini host.
-        if "generativelanguage.googleapis.com" in raw:
-            raw = raw.rstrip("/") + "/openai"
-
-    return raw
-
-
 def _get_model():
     return os.getenv("AI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
 
 def llm_is_configured():
     """True only when we have everything needed to call the provider."""
-    return bool(_get_api_key() and _get_base_url() and _get_model())
+    return bool(_get_api_key() and _get_model())
 
 
 # ---------------------------------------------------------------------------
@@ -174,22 +140,16 @@ def _extract_json(content):
 # ---------------------------------------------------------------------------
 # LLM call
 # ---------------------------------------------------------------------------
-def _build_endpoint():
-    """
-    Build the full chat-completions URL exactly once.
-    """
-    base = _get_base_url().rstrip("/")
-    return base + "/chat/completions"
-
-
 def _llm_analysis(message, context=None):
     """Call Gemini through its OpenAI-compatible API endpoint."""
     api_key = _get_api_key()
     model = _get_model()
-    endpoint = _build_endpoint()
+    endpoint = GEMINI_CHAT_COMPLETIONS_URL
 
     if not api_key:
-        raise RuntimeError("No API key configured (OPENAI_API_KEY / GEMINI_API_KEY).")
+        raise RuntimeError(
+            "No API key configured (OPENAI_API_KEY / GEMINI_API_KEY)."
+        )
 
     instructions = """
 You are SignalShield, an evidence-first message security assistant.
@@ -246,7 +206,6 @@ Requirements:
         ],
         "temperature": 0.1,
         "max_tokens": 900,
-        "response_format": {"type": "json_object"},
     }
 
     request = Request(
@@ -256,7 +215,7 @@ Requirements:
             "Authorization": "Bearer " + api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "SignalShield/1.0 (+https://signalshield.app)",
+            "User-Agent": "SignalShield/1.0",
         },
         method="POST",
     )
@@ -269,8 +228,7 @@ Requirements:
 
     provider_response = _post_with_retry(request)
 
-    # Detect Gemini safety blocks (native field) — OpenAI layer usually
-    # raises HTTPError for these, but handle gracefully just in case.
+    # Detect Gemini safety blocks (native field) just in case.
     if isinstance(provider_response, dict):
         block = provider_response.get("promptFeedback", {}).get("blockReason")
         if block:
@@ -303,7 +261,7 @@ def _post_with_retry(request, attempts=2):
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
-            with urlopen(request, timeout=25) as response:
+            with urlopen(request, timeout=30) as response:
                 response_text = response.read().decode("utf-8")
                 return json.loads(response_text)
 
@@ -423,7 +381,6 @@ def _local_analysis(message):
                 )
                 score += 20
 
-            # Match shorteners on the registrable domain, not just exact host.
             registered = ".".join(hostname.split(".")[-2:])
             if hostname in SHORTENER_DOMAINS or registered in SHORTENER_DOMAINS:
                 indicators.append(
