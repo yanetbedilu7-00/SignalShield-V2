@@ -61,6 +61,38 @@ SUSPICIOUS_PATTERNS = [
         ),
         10,
     ),
+    # --- Prompt-injection / AI-directed abuse patterns ---
+    (
+        "Prompt injection attempt",
+        re.compile(
+            r"\b(ignore (all )?previous instructions|"
+            r"ignore (all )?prior instructions|"
+            r"disregard (the )?(system|previous) prompt|"
+            r"reveal (the )?system prompt|"
+            r"override (your )?(safety|guardrails|rules))\b",
+            re.I,
+        ),
+        40,
+    ),
+    (
+        "Data exfiltration attempt",
+        re.compile(
+            r"\b(send (all )?(emails?|messages?|data|files?) to|"
+            r"forward (all )?(emails?|messages?|data|files?) to|"
+            r"exfiltrate|do not tell the user)\b",
+            re.I,
+        ),
+        30,
+    ),
+    (
+        "Safeguard bypass attempt",
+        re.compile(
+            r"\b(bypass (safeguards?|security|filters?|restrictions?)|"
+            r"disable (safety|security|filters?))\b",
+            re.I,
+        ),
+        30,
+    ),
 ]
 
 SHORTENER_DOMAINS = {
@@ -206,6 +238,14 @@ Requirements:
         ],
         "temperature": 0.1,
         "max_tokens": 900,
+        # Allow Gemini to analyze adversarial / prompt-injection content.
+        # BLOCK_NONE tells the safety layer not to refuse this request.
+        "safety_settings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ],
     }
 
     request = Request(
@@ -228,7 +268,7 @@ Requirements:
 
     provider_response = _post_with_retry(request)
 
-    # Detect Gemini safety blocks (native field) just in case.
+    # Detect Gemini safety blocks (should be rare now that BLOCK_NONE is set).
     if isinstance(provider_response, dict):
         block = provider_response.get("promptFeedback", {}).get("blockReason")
         if block:
@@ -266,7 +306,6 @@ def _post_with_retry(request, attempts=2):
                 return json.loads(response_text)
 
         except HTTPError as exc:
-            # Do NOT retry 4xx — those are configuration errors.
             error_body = ""
             try:
                 error_body = exc.read().decode("utf-8", errors="replace")
@@ -463,6 +502,8 @@ def analyze_message(message, context=None):
     if context is not None:
         context = str(context).strip()[:5000]
 
+    ai_error = None
+
     if llm_is_configured():
         try:
             result = _llm_analysis(message, context)
@@ -470,10 +511,15 @@ def analyze_message(message, context=None):
             result["ai_used"] = True
             return result
 
-        except Exception:
+        except Exception as exc:
             logger.exception("SignalShield AI analysis failed")
+            ai_error = str(exc)[:200]
+
+    else:
+        ai_error = "AI provider is not configured."
 
     result = _local_analysis(message)
     result["mode"] = LOCAL_MODE
     result["ai_used"] = False
+    result["ai_error"] = ai_error
     return result
