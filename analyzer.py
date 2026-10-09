@@ -1,9 +1,9 @@
-
 import json
 import logging
 import os
 import re
 import socket
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
@@ -13,6 +13,14 @@ logger = logging.getLogger("signalshield")
 
 AI_MODE = "AI-assisted analysis"
 LOCAL_MODE = "Transparent local checks (AI provider unavailable)"
+
+# ---------------------------------------------------------------------------
+# Provider configuration
+# ---------------------------------------------------------------------------
+# Gemini's OpenAI-compatible base URL. Do NOT include /chat/completions here;
+# the code below appends it once, safely.
+DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+DEFAULT_MODEL = "gemini-2.5-flash"
 
 SUSPICIOUS_PATTERNS = [
     (
@@ -65,15 +73,65 @@ SHORTENER_DOMAINS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Configuration helpers
+# ---------------------------------------------------------------------------
+def _get_api_key():
+    """Return the API key from env, supporting several common names."""
+    for name in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _get_base_url():
+    """
+    Return a normalized base URL ending with /openai (no trailing slash).
+
+    This is defensive: it accepts whatever the user put in OPENAI_BASE_URL
+    and rewrites it into the one form that actually works with Gemini.
+    """
+    raw = os.getenv("OPENAI_BASE_URL", "").strip()
+
+    if not raw:
+        return DEFAULT_BASE_URL
+
+    # Strip trailing slashes.
+    raw = raw.rstrip("/")
+
+    # If the user accidentally included /chat/completions, remove it.
+    if raw.endswith("/chat/completions"):
+        raw = raw[: -len("/chat/completions")]
+
+    # If they pointed at the native endpoint (…/v1beta), turn it into the
+    # OpenAI-compatible endpoint (…/v1beta/openai).
+    if raw.endswith("/v1beta"):
+        raw = raw + "/openai"
+    elif raw.endswith("/v1"):
+        raw = raw[:-3] + "/v1beta/openai"
+
+    # If they gave a full OpenAI-style base but forgot /openai, add it.
+    if not raw.endswith("/openai"):
+        # Only append if the path looks like the Gemini host.
+        if "generativelanguage.googleapis.com" in raw:
+            raw = raw.rstrip("/") + "/openai"
+
+    return raw
+
+
+def _get_model():
+    return os.getenv("AI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+
+
 def llm_is_configured():
-    """Check whether the required provider settings exist."""
-    return bool(
-        os.getenv("OPENAI_API_KEY", "").strip()
-        and os.getenv("OPENAI_BASE_URL", "").strip()
-        and os.getenv("AI_MODEL", "gemini-2.5-flash").strip()
-    )
+    """True only when we have everything needed to call the provider."""
+    return bool(_get_api_key() and _get_base_url() and _get_model())
 
 
+# ---------------------------------------------------------------------------
+# JSON extraction
+# ---------------------------------------------------------------------------
 def _extract_json(content):
     """Parse JSON returned by the model, including fenced JSON."""
     if isinstance(content, list):
@@ -88,7 +146,6 @@ def _extract_json(content):
 
     content = content.strip()
 
-    # Remove optional Markdown code fences.
     content = re.sub(
         r"^\s*```(?:json)?\s*",
         "",
@@ -114,26 +171,25 @@ def _extract_json(content):
     return result
 
 
+# ---------------------------------------------------------------------------
+# LLM call
+# ---------------------------------------------------------------------------
+def _build_endpoint():
+    """
+    Build the full chat-completions URL exactly once.
+    """
+    base = _get_base_url().rstrip("/")
+    return base + "/chat/completions"
+
+
 def _llm_analysis(message, context=None):
     """Call Gemini through its OpenAI-compatible API endpoint."""
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    base_url = os.getenv(
-        "OPENAI_BASE_URL",
-        "https://generativelanguage.googleapis.com/v1beta/openai/",
-    ).strip().rstrip("/")
-    model = os.getenv("AI_MODEL", "gemini-2.5-flash").strip()
+    api_key = _get_api_key()
+    model = _get_model()
+    endpoint = _build_endpoint()
 
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is missing.")
-
-    if not base_url:
-        raise RuntimeError("OPENAI_BASE_URL is missing.")
-
-    if not model:
-        raise RuntimeError("AI_MODEL is missing.")
-
-    if not base_url.endswith("/chat/completions"):
-        base_url += "/chat/completions"
+        raise RuntimeError("No API key configured (OPENAI_API_KEY / GEMINI_API_KEY).")
 
     instructions = """
 You are SignalShield, an evidence-first message security assistant.
@@ -190,61 +246,39 @@ Requirements:
         ],
         "temperature": 0.1,
         "max_tokens": 900,
+        "response_format": {"type": "json_object"},
     }
 
     request = Request(
-        base_url,
+        endpoint,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": "Bearer " + api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": "SignalShield/1.0 (+https://signalshield.app)",
         },
         method="POST",
     )
 
-    try:
-        with urlopen(request, timeout=25) as response:
-            response_text = response.read().decode("utf-8")
-            provider_response = json.loads(response_text)
+    logger.info(
+        "SignalShield calling AI provider at %s with model %s",
+        endpoint,
+        model,
+    )
 
-    except HTTPError as exc:
-        # Log provider details, but never log the request or API key.
-        error_body = ""
-        try:
-            error_body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
+    provider_response = _post_with_retry(request)
 
-        logger.error(
-            "SignalShield AI provider returned HTTP %s. Response: %s",
-            exc.code,
-            error_body[:1500],
-        )
-        raise RuntimeError(
-            "AI provider returned HTTP {}.".format(exc.code)
-        ) from exc
-
-    except (URLError, TimeoutError, socket.timeout) as exc:
-        logger.error(
-            "SignalShield AI connection failed: %s",
-            type(exc).__name__,
-        )
-        raise RuntimeError(
-            "Could not connect to the AI provider."
-        ) from exc
-
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        logger.error(
-            "SignalShield could not decode the provider response: %s",
-            type(exc).__name__,
-        )
-        raise RuntimeError(
-            "AI provider returned an unreadable response."
-        ) from exc
+    # Detect Gemini safety blocks (native field) — OpenAI layer usually
+    # raises HTTPError for these, but handle gracefully just in case.
+    if isinstance(provider_response, dict):
+        block = provider_response.get("promptFeedback", {}).get("blockReason")
+        if block:
+            raise RuntimeError(f"AI provider blocked the prompt: {block}")
 
     try:
-        content = provider_response["choices"][0]["message"]["content"]
+        choice = provider_response["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         logger.error(
             "Unexpected AI response structure. Top-level keys: %s",
@@ -256,9 +290,66 @@ Requirements:
             "AI provider response had an unexpected format."
         ) from exc
 
-    result = _extract_json(content)
+    finish_reason = choice.get("finish_reason")
+    if finish_reason == "length":
+        logger.warning("AI response was truncated by max_tokens.")
 
-    # Validate and normalize the model output.
+    result = _extract_json(content)
+    return _normalize_result(result)
+
+
+def _post_with_retry(request, attempts=2):
+    """POST with one retry on transient network errors."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with urlopen(request, timeout=25) as response:
+                response_text = response.read().decode("utf-8")
+                return json.loads(response_text)
+
+        except HTTPError as exc:
+            # Do NOT retry 4xx — those are configuration errors.
+            error_body = ""
+            try:
+                error_body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+            logger.error(
+                "AI provider HTTP %s at %s. Response: %s",
+                exc.code,
+                request.full_url,
+                error_body[:1500],
+            )
+            raise RuntimeError(
+                "AI provider returned HTTP {}.".format(exc.code)
+            ) from exc
+
+        except (URLError, TimeoutError, socket.timeout) as exc:
+            last_exc = exc
+            logger.warning(
+                "AI connection attempt %s/%s failed: %s",
+                attempt,
+                attempts,
+                type(exc).__name__,
+            )
+            if attempt < attempts:
+                time.sleep(1.0)
+
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.error(
+                "Could not decode provider response: %s",
+                type(exc).__name__,
+            )
+            raise RuntimeError(
+                "AI provider returned an unreadable response."
+            ) from exc
+
+    raise RuntimeError("Could not connect to the AI provider.") from last_exc
+
+
+def _normalize_result(result):
+    """Validate and normalize the model output."""
     try:
         score = int(result.get("risk_score", 0))
     except (TypeError, ValueError) as exc:
@@ -292,6 +383,9 @@ Requirements:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Local fallback
+# ---------------------------------------------------------------------------
 def _local_analysis(message):
     """Run explainable, rule-based checks without an AI connection."""
     indicators = []
@@ -329,7 +423,9 @@ def _local_analysis(message):
                 )
                 score += 20
 
-            if hostname in SHORTENER_DOMAINS:
+            # Match shorteners on the registrable domain, not just exact host.
+            registered = ".".join(hostname.split(".")[-2:])
+            if hostname in SHORTENER_DOMAINS or registered in SHORTENER_DOMAINS:
                 indicators.append(
                     {
                         "title": "Shortened URL",
@@ -392,12 +488,12 @@ def _local_analysis(message):
     }
 
 
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 def analyze_message(message, context=None):
     """
     Analyze a message using AI when available, with local fallback.
-
-    The fallback ensures the app can still return useful results if the
-    provider is unavailable. The mode field identifies which analysis ran.
     """
     if not isinstance(message, str) or not message.strip():
         raise ValueError("Please enter a message to analyze.")
@@ -418,8 +514,6 @@ def analyze_message(message, context=None):
             return result
 
         except Exception:
-            # IMPORTANT: this prints the traceback in deployment logs.
-            # It deliberately does not print environment variables or keys.
             logger.exception("SignalShield AI analysis failed")
 
     result = _local_analysis(message)
