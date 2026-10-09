@@ -238,14 +238,16 @@ Requirements:
         ],
         "temperature": 0.1,
         "max_tokens": 900,
-        # Allow Gemini to analyze adversarial / prompt-injection content.
-        # BLOCK_NONE tells the safety layer not to refuse this request.
-        "safety_settings": [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ],
+        # Gemini-specific overrides must go inside extra_body for the
+        # OpenAI-compatible layer to recognise them.
+        "extra_body": {
+            "safety_settings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+        },
     }
 
     request = Request(
