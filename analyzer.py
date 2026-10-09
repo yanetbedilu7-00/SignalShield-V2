@@ -14,10 +14,6 @@ logger = logging.getLogger("signalshield")
 AI_MODE = "AI-assisted analysis"
 LOCAL_MODE = "Transparent local checks (AI provider unavailable)"
 
-# ---------------------------------------------------------------------------
-# Provider configuration — hardcoded, no env var needed for the URL.
-# Gemini's OpenAI-compatible chat-completions endpoint (full path).
-# ---------------------------------------------------------------------------
 GEMINI_CHAT_COMPLETIONS_URL = (
     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 )
@@ -61,7 +57,6 @@ SUSPICIOUS_PATTERNS = [
         ),
         10,
     ),
-    # --- Prompt-injection / AI-directed abuse patterns ---
     (
         "Prompt injection attempt",
         re.compile(
@@ -106,11 +101,7 @@ SHORTENER_DOMAINS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Configuration helpers
-# ---------------------------------------------------------------------------
 def _get_api_key():
-    """Return the API key from env, supporting several common names."""
     for name in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
         value = os.getenv(name, "").strip()
         if value:
@@ -123,15 +114,10 @@ def _get_model():
 
 
 def llm_is_configured():
-    """True only when we have everything needed to call the provider."""
     return bool(_get_api_key() and _get_model())
 
 
-# ---------------------------------------------------------------------------
-# JSON extraction
-# ---------------------------------------------------------------------------
 def _extract_json(content):
-    """Parse JSON returned by the model, including fenced JSON."""
     if isinstance(content, list):
         content = "".join(
             part.get("text", "")
@@ -169,11 +155,7 @@ def _extract_json(content):
     return result
 
 
-# ---------------------------------------------------------------------------
-# LLM call
-# ---------------------------------------------------------------------------
 def _llm_analysis(message, context=None):
-    """Call Gemini through its OpenAI-compatible API endpoint."""
     api_key = _get_api_key()
     model = _get_model()
     endpoint = GEMINI_CHAT_COMPLETIONS_URL
@@ -238,16 +220,12 @@ Requirements:
         ],
         "temperature": 0.1,
         "max_tokens": 900,
-        # Gemini-specific overrides must go inside extra_body for the
-        # OpenAI-compatible layer to recognise them.
-        "extra_body": {
-            "safety_settings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ]
-        },
+        "safety_settings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ],
     }
 
     request = Request(
@@ -270,7 +248,6 @@ Requirements:
 
     provider_response = _post_with_retry(request)
 
-    # Detect Gemini safety blocks (should be rare now that BLOCK_NONE is set).
     if isinstance(provider_response, dict):
         block = provider_response.get("promptFeedback", {}).get("blockReason")
         if block:
@@ -299,7 +276,6 @@ Requirements:
 
 
 def _post_with_retry(request, attempts=2):
-    """POST with one retry on transient network errors."""
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
@@ -348,7 +324,6 @@ def _post_with_retry(request, attempts=2):
 
 
 def _normalize_result(result):
-    """Validate and normalize the model output."""
     try:
         score = int(result.get("risk_score", 0))
     except (TypeError, ValueError) as exc:
@@ -382,11 +357,7 @@ def _normalize_result(result):
     return result
 
 
-# ---------------------------------------------------------------------------
-# Local fallback
-# ---------------------------------------------------------------------------
 def _local_analysis(message):
-    """Run explainable, rule-based checks without an AI connection."""
     indicators = []
     score = 0
 
@@ -486,13 +457,7 @@ def _local_analysis(message):
     }
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
 def analyze_message(message, context=None):
-    """
-    Analyze a message using AI when available, with local fallback.
-    """
     if not isinstance(message, str) or not message.strip():
         raise ValueError("Please enter a message to analyze.")
 
